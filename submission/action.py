@@ -82,12 +82,20 @@ def ev_action_decision(
     p_opp_continues = 1.0 - p_opp_fold
 
     # EV(raise r): opp folds -> win current pot; opp continues -> go to showdown
+    # Continuation range after we raise is stronger than random, especially on
+    # later streets and dangerous boards.
+    p_win_raise = p_win
+    if street >= 1:
+        pressure = (call_amount / max(1.0, pot)) + max(0.0, min(1.0, float(board_threat))) * 0.8
+        raise_discount = min(0.35, 0.18 * pressure)
+        p_win_raise = p_win * (1.0 - raise_discount)
+
     raise_r = max(min_raise, int(max_raise * 0.12))
     chips_in = call_amount + raise_r
     showdown_pot = pot + call_amount + 2 * raise_r
     ev_raise = (
         p_opp_fold * pot
-        + p_opp_continues * (p_win * showdown_pot - chips_in)
+        + p_opp_continues * (p_win_raise * showdown_pot - chips_in)
     )
 
     # Final raise sizing: scale bet with hand strength
@@ -144,10 +152,11 @@ def ev_action_decision(
     best = max(evs, key=lambda a: evs[a])
 
     # Near breakeven calls are sensitive to simulation/model noise.
-    # Avoid over-folding: if call EV is only slightly negative, prefer CALL.
+    # Only apply anti-overfold in early/small-pot situations.
     if best == "FOLD" and can_call:
         noise_margin = 0.05 * pot
-        if ev_call >= -noise_margin:
+        small_call = call_amount <= int(0.10 * max(1, pot))
+        if street <= 1 and small_call and ev_call >= -noise_margin:
             best = "CALL"
 
     print(
