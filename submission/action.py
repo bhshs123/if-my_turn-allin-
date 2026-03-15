@@ -3,18 +3,18 @@ from submission.strategies.basic import predict_hand_winrate, update_pool
 from itertools import combinations
 
 
-def _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community=None):
+def _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community=None, extra_dead=None):
     remaining_card_pool.clear()
     remaining_card_pool.update(range(27))
 
     seen_cards = list(valid_hole)
     if valid_community is not None:
         seen_cards.extend(valid_community)
+    # Exclude known discarded cards (mine + opponent's) — they're out of play.
+    if extra_dead is not None:
+        seen_cards.extend(extra_dead)
 
-    # Keep using the pool update helper from basic as requested.
     update_pool(seen_cards)
-
-    # Ensure the pool instance passed into action stays synchronized.
     for c in seen_cards:
         remaining_card_pool.discard(c)
 
@@ -39,22 +39,22 @@ def action_from_winrate(
 
     action_types = PokerEnv.ActionType
 
-    if winrate < 15:
+    if winrate < 20:
         return action_types.FOLD.value, 0, 0, 0
 
     if winrate > 90 and valid_actions[action_types.RAISE.value]:
         amt = max(min_raise, int(max_raise * 0.2))
         return action_types.RAISE.value, amt, 0, 0
 
-    if winrate > 70 and valid_actions[action_types.RAISE.value]:
+    if winrate > 80 and valid_actions[action_types.RAISE.value]:
         amt = max(min_raise, int(max_raise * 0.15))
         return action_types.RAISE.value, amt, 0, 0
 
-    if winrate > 50 and valid_actions[action_types.RAISE.value]:
+    if winrate > 70 and valid_actions[action_types.RAISE.value]:
         amt = max(min_raise, int(max_raise * 0.1))
         return action_types.RAISE.value, amt, 0, 0
 
-    if winrate > 15 and valid_actions[action_types.CHECK.value]:
+    if winrate > 20 and valid_actions[action_types.CHECK.value]:
         return action_types.CHECK.value, 0, 0, 0
 
     if valid_actions[action_types.CALL.value]:
@@ -79,10 +79,10 @@ def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
-def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
+def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
-    _refresh_remaining_pool(remaining_card_pool, valid_hole, community)
+    _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
 
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[flop_action] winrate={winrate}")
@@ -90,11 +90,11 @@ def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, m
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
-def discard_action(my_cards, community_cards, remaining_card_pool):
+def discard_action(my_cards, community_cards, remaining_card_pool, dead_cards=None):
     # Keep only visible cards; community may contain -1 placeholders.
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     valid_community = [c for c in community_cards if isinstance(c, int) and c >= 0]
-    _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community)
+    _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community, extra_dead=dead_cards)
 
     # my_cards has 5 cards, community_cards has 3, find best 2 to keep
     best_winrate = 0
@@ -111,21 +111,21 @@ def discard_action(my_cards, community_cards, remaining_card_pool):
     return action_types.DISCARD.value, 0, best_indices[0], best_indices[1]
 
 
-def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
+def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
-    _refresh_remaining_pool(remaining_card_pool, valid_hole, community)
+    _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
 
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[turn_action] winrate={winrate}")
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
-def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
+def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
-    _refresh_remaining_pool(remaining_card_pool, valid_hole, community)
-    
+    _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
+
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[river_action] winrate={winrate}")
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)

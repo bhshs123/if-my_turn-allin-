@@ -12,8 +12,8 @@ WINRATE_TRIALS = 10
 
 def reset_pool() -> None:
     """Reset the card pool to contain all cards (0-26)."""
-    remaining_card_pool.clear()
-    remaining_card_pool.update(range(27))
+    global remaining_card_pool
+    remaining_card_pool = set(range(27))
 
 
 def update_pool(seen_cards: Iterable[int]) -> None:

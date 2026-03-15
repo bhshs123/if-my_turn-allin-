@@ -31,6 +31,10 @@ class PlayerAgent(Agent):
         community_cards = observation.get("community_cards", [])
         min_raise = observation.get("min_raise", 1)
         max_raise = observation.get("max_raise", 100)
+        # Collect known-discarded cards so the pool excludes them from simulation.
+        my_discarded = [c for c in observation.get("my_discarded_cards", []) if isinstance(c, int) and c >= 0]
+        opp_discarded = [c for c in observation.get("opp_discarded_cards", []) if isinstance(c, int) and c >= 0]
+        dead_cards = my_discarded + opp_discarded
 
         # --- Pre-flop (street 0) ---
         if street == 0:
@@ -38,19 +42,19 @@ class PlayerAgent(Agent):
 
         # --- Flop discard round (street 1) ---
         if street == 1 and valid_actions[self.action_types.DISCARD.value]:
-            return discard_action(my_cards, community_cards, remaining_card_pool)
+            return discard_action(my_cards, community_cards, remaining_card_pool, dead_cards=dead_cards)
 
         # --- Flop betting (street 1 after discard) ---
         if street == 1:
-            return flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise)
+            return flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=dead_cards)
 
         # --- Turn (street 2) ---
         if street == 2:
-            return turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise)
+            return turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=dead_cards)
 
         # --- River (street 3) ---
         if street == 3:
-            return river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise)
+            return river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=dead_cards)
 
         # Fallback
         return self.action_types.FOLD.value, 0, 0, 0
