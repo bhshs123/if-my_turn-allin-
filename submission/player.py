@@ -19,6 +19,7 @@ class PlayerAgent(Agent):
         else:
             self._my_player_id = 0
         self._hand_counter = 0
+        self._last_decision: dict | None = None
 
         # Pending public state where opponent is about to act; confirmed on next opp_last_action.
         self._pending_opp_state: dict | None = None
@@ -57,6 +58,22 @@ class PlayerAgent(Agent):
     def _action_name_to_id(self, action_name: str) -> int:
         return PokerEnv.ActionType[action_name].value
 
+    def _fmt_cards(self, cards):
+        out = []
+        for card in cards or []:
+            if isinstance(card, int) and card >= 0:
+                try:
+                    out.append(PokerEnv.int_to_card(card))
+                except Exception:
+                    out.append(str(card))
+        return out
+
+    def _action_tuple_to_name(self, action_tuple) -> str:
+        try:
+            return PokerEnv.ActionType(action_tuple[0]).name
+        except Exception:
+            return str(action_tuple[0])
+
     def _apply_action_override(self, base_action, chosen_action_name, min_raise, max_raise, observation):
         if chosen_action_name is None:
             return base_action
@@ -66,9 +83,21 @@ class PlayerAgent(Agent):
         if chosen_id == base_type:
             return base_action
 
+        # Warmup data is too noisy for action overrides; collect observations only.
+        if self._hand_counter <= self._dbbr.config.warmup_iters:
+            return base_action
+
         # Keep fold/call/check decisions EV-driven; DBBR exploit can tune aggression,
         # but should not force extra folds that look unintelligent.
         if chosen_action_name == "FOLD":
+            return base_action
+
+        # If EV says fold/call/check, do not turn that into a looser action.
+        if base_type in (
+            PokerEnv.ActionType.FOLD.value,
+            PokerEnv.ActionType.CALL.value,
+            PokerEnv.ActionType.CHECK.value,
+        ):
             return base_action
 
         # Never fold when a free check exists (defensive safety invariant).
@@ -155,7 +184,22 @@ class PlayerAgent(Agent):
                 pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
-            return self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            self._last_decision = {
+                "hand": info.get("hand_number"),
+                "street": street,
+                "my_cards": self._fmt_cards(my_cards),
+                "board": self._fmt_cards(community_cards),
+                "my_bet": my_bet,
+                "opp_bet": opp_bet,
+                "pot": pot_size,
+                "opp_probs": dict(opp_action_probs),
+                "base": self._action_tuple_to_name(base_action),
+                "override": chosen,
+                "final": self._action_tuple_to_name(final_action),
+            }
+            print(f"[decision] {self._last_decision}")
+            return final_action
 
         # --- Flop discard round (street 1) ---
         if street == 1 and valid_actions[self.action_types.DISCARD.value]:
@@ -168,7 +212,22 @@ class PlayerAgent(Agent):
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
-            return self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            self._last_decision = {
+                "hand": info.get("hand_number"),
+                "street": street,
+                "my_cards": self._fmt_cards(my_cards),
+                "board": self._fmt_cards(community_cards),
+                "my_bet": my_bet,
+                "opp_bet": opp_bet,
+                "pot": pot_size,
+                "opp_probs": dict(opp_action_probs),
+                "base": self._action_tuple_to_name(base_action),
+                "override": chosen,
+                "final": self._action_tuple_to_name(final_action),
+            }
+            print(f"[decision] {self._last_decision}")
+            return final_action
 
         # --- Turn (street 2) ---
         if street == 2:
@@ -177,7 +236,22 @@ class PlayerAgent(Agent):
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
-            return self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            self._last_decision = {
+                "hand": info.get("hand_number"),
+                "street": street,
+                "my_cards": self._fmt_cards(my_cards),
+                "board": self._fmt_cards(community_cards),
+                "my_bet": my_bet,
+                "opp_bet": opp_bet,
+                "pot": pot_size,
+                "opp_probs": dict(opp_action_probs),
+                "base": self._action_tuple_to_name(base_action),
+                "override": chosen,
+                "final": self._action_tuple_to_name(final_action),
+            }
+            print(f"[decision] {self._last_decision}")
+            return final_action
 
         # --- River (street 3) ---
         if street == 3:
@@ -186,13 +260,28 @@ class PlayerAgent(Agent):
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
-            return self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
+            self._last_decision = {
+                "hand": info.get("hand_number"),
+                "street": street,
+                "my_cards": self._fmt_cards(my_cards),
+                "board": self._fmt_cards(community_cards),
+                "my_bet": my_bet,
+                "opp_bet": opp_bet,
+                "pot": pot_size,
+                "opp_probs": dict(opp_action_probs),
+                "base": self._action_tuple_to_name(base_action),
+                "override": chosen,
+                "final": self._action_tuple_to_name(final_action),
+            }
+            print(f"[decision] {self._last_decision}")
+            return final_action
 
         # Fallback
         return self.action_types.FOLD.value, 0, 0, 0
 
     def observe(self, observation, reward, terminated, truncated, info) -> None:
-        _ = reward, truncated, info
+        _ = truncated
         # Before opponent acts, cache the public state; action label will arrive as opp_last_action.
         if int(observation.get("acting_agent", -1)) != self._my_player_id:
             self._pending_opp_state = dict(observation)
@@ -200,6 +289,19 @@ class PlayerAgent(Agent):
 
         # Match-level DBBR schedule is hand-based; update on terminal observation.
         if terminated:
+            showdown = "player_0_cards" in info and "player_1_cards" in info
+            result = "win" if reward > 0 else "loss" if reward < 0 else "tie"
+            summary = {
+                "hand": info.get("hand_number"),
+                "result": result,
+                "reward": reward,
+                "showdown": showdown,
+                "board": info.get("community_cards"),
+                "p0": info.get("player_0_cards"),
+                "p1": info.get("player_1_cards"),
+                "last_decision": self._last_decision,
+            }
+            print(f"[hand_end] {summary}")
             self._hand_counter += 1
             self._dbbr.maybe_update_model(self._hand_counter)
 
