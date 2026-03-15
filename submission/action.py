@@ -10,7 +10,7 @@ def _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community=Non
     seen_cards = list(valid_hole)
     if valid_community is not None:
         seen_cards.extend(valid_community)
-    # Exclude known discarded cards (mine + opponent's) — they're out of play.
+    # Exclude known discarded cards (mine + opponent''s) -- they''re out of play.
     if extra_dead is not None:
         seen_cards.extend(extra_dead)
 
@@ -19,51 +19,112 @@ def _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community=Non
         remaining_card_pool.discard(c)
 
 
-def action_from_winrate(
+def ev_action_decision(
     winrate: int,
-    valid_actions: list[bool],
+    valid_actions: list,
     min_raise: int,
     max_raise: int,
-) -> tuple[int, int, int, int]:
-    """Convert a winrate score into a pre-flop action.
+    pot_size: int,
+    my_bet: int,
+    opp_bet: int,
+    opp_action_probs: dict,
+) -> tuple:
+    """EV-based fold/call/raise/check decision (game tree spec, Sections 4-5).
 
-    Args:
-        winrate: winrate score (0-100) from predict_hand_winrate.
-        valid_actions: boolean list of valid actions from environment.
-        min_raise: minimum raise amount (from env observation).
-        max_raise: maximum raise amount (from env observation).
+    EV(fold)    = 0
+    EV(call)    = P(win) * (pot + call_amount) - call_amount
+    EV(raise r) = P(opp_fold) * pot
+                  + P(opp_continues) * (P(win) * (pot + call_amount + 2r) - (call_amount + r))
 
-    Returns:
-        Action tuple for the gym environment.
+    P(opp_fold) = gamma[n, "FOLD"] = sum_b beta[n,b] * sigma[n,b,fold]
+    from the DBBR opponent model (or baseline heuristic during warmup).
+
+    Argmax EV determines the action. CHECK always dominates FOLD (it is free).
     """
-
     action_types = PokerEnv.ActionType
+    p_win = max(0.0, min(1.0, winrate / 100.0))
+    call_amount = max(0, opp_bet - my_bet)
+    pot = max(1, pot_size)
 
-    if winrate < 20:
+    can_fold = bool(valid_actions[action_types.FOLD.value])
+    can_call = bool(valid_actions[action_types.CALL.value])
+    can_check = bool(valid_actions[action_types.CHECK.value])
+    can_raise = bool(valid_actions[action_types.RAISE.value]) and max_raise >= min_raise > 0
+
+    # EV(fold) = 0 -- give up, no further chip commitment
+    ev_fold = 0.0
+
+    # EV(call/check): if no bet to call this is a free check
+    if call_amount > 0:
+        ev_call = p_win * (pot + call_amount) - call_amount
+    else:
+        ev_call = p_win * pot  # free check: rough equity share of pot
+
+    # P(opp_fold) = gamma[n,"FOLD"] = sum_b beta[n,b]*sigma[n,b,fold]  (Section 4)
+    p_opp_fold = float(opp_action_probs.get("FOLD", 0.0)) if opp_action_probs else 0.0
+    p_opp_continues = 1.0 - p_opp_fold
+
+    # EV(raise r): opp folds -> win current pot; opp continues -> go to showdown
+    raise_r = max(min_raise, int(max_raise * 0.12))
+    chips_in = call_amount + raise_r
+    showdown_pot = pot + call_amount + 2 * raise_r
+    ev_raise = (
+        p_opp_fold * pot
+        + p_opp_continues * (p_win * showdown_pot - chips_in)
+    )
+
+    # Final raise sizing: scale bet with hand strength
+    if winrate > 80:
+        raise_r_final = max(min_raise, int(max_raise * 0.20))
+    elif winrate > 70:
+        raise_r_final = max(min_raise, int(max_raise * 0.15))
+    else:
+        raise_r_final = max(min_raise, int(max_raise * 0.12))
+
+    # Build EV map over valid actions
+    evs = {}
+    if can_raise:
+        evs["RAISE"] = ev_raise
+    if can_call:
+        evs["CALL"] = ev_call
+    if can_check:
+        evs["CHECK"] = ev_call  # same formula (call_amount == 0 when CHECK is legal)
+    if can_fold:
+        evs["FOLD"] = ev_fold
+
+    if not evs:
         return action_types.FOLD.value, 0, 0, 0
 
-    if winrate > 90 and valid_actions[action_types.RAISE.value]:
-        amt = max(min_raise, int(max_raise * 0.2))
-        return action_types.RAISE.value, amt, 0, 0
+    # CHECK always dominates FOLD -- never fold when checking is free
+    if can_check and "FOLD" in evs:
+        evs.pop("FOLD")
 
-    if winrate > 80 and valid_actions[action_types.RAISE.value]:
-        amt = max(min_raise, int(max_raise * 0.15))
-        return action_types.RAISE.value, amt, 0, 0
+    best = max(evs, key=lambda a: evs[a])
 
-    if winrate > 70 and valid_actions[action_types.RAISE.value]:
-        amt = max(min_raise, int(max_raise * 0.1))
-        return action_types.RAISE.value, amt, 0, 0
+    # Near breakeven calls are sensitive to simulation/model noise.
+    # Avoid over-folding: if call EV is only slightly negative, prefer CALL.
+    if best == "FOLD" and can_call:
+        noise_margin = 0.05 * pot
+        if ev_call >= -noise_margin:
+            best = "CALL"
 
-    if winrate > 20 and valid_actions[action_types.CHECK.value]:
-        return action_types.CHECK.value, 0, 0, 0
+    print(
+        f"[ev] winrate={winrate} call={call_amount} pot={pot} "
+        f"p_opp_fold={p_opp_fold:.2f} "
+        f"EV(fold)={ev_fold:.1f} EV(call/chk)={ev_call:.1f} EV(raise)={ev_raise:.1f} -> {best}"
+    )
 
-    if valid_actions[action_types.CALL.value]:
+    if best == "RAISE":
+        return action_types.RAISE.value, raise_r_final, 0, 0
+    if best == "CALL":
         return action_types.CALL.value, 0, 0, 0
-
+    if best == "CHECK":
+        return action_types.CHECK.value, 0, 0, 0
     return action_types.FOLD.value, 0, 0, 0
 
 
-def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
+def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
+                   pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole)
 
@@ -72,63 +133,66 @@ def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_
     else:
         winrates = []
         for combo in combinations(valid_hole, 2):
-            winrate = predict_hand_winrate(list(combo), remaining_card_pool, [])
-            winrates.append(winrate)
+            wr = predict_hand_winrate(list(combo), remaining_card_pool, [])
+            winrates.append(wr)
         winrate = max(winrates) if winrates else 0
     print(f"[preflop_action] winrate={winrate}")
-    return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
+    return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
+                              pot_size, my_bet, opp_bet, opp_action_probs)
 
 
-def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
+def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
+                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
 
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[flop_action] winrate={winrate}")
-    # Similar logic to preflop, but perhaps adjust thresholds if needed
-    return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
+    return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
+                              pot_size, my_bet, opp_bet, opp_action_probs)
 
 
 def discard_action(my_cards, community_cards, remaining_card_pool, dead_cards=None):
-    # Keep only visible cards; community may contain -1 placeholders.
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     valid_community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community, extra_dead=dead_cards)
 
-    # my_cards has 5 cards, community_cards has 3, find best 2 to keep
     best_winrate = 0
-    best_indices = (0, 1)  # default
+    best_indices = (0, 1)
     for combo in combinations(range(len(valid_hole)), 2):
         hand = [valid_hole[i] for i in combo]
-        winrate = predict_hand_winrate(hand, remaining_card_pool, valid_community)
-        if winrate > best_winrate:
-            best_winrate = winrate
+        wr = predict_hand_winrate(hand, remaining_card_pool, valid_community)
+        if wr > best_winrate:
+            best_winrate = wr
             best_indices = combo
     print(f"[discard_action] winrate={best_winrate}")
-    # Action: DISCARD, 0, keep_card_1, keep_card_2
     action_types = PokerEnv.ActionType
     return action_types.DISCARD.value, 0, best_indices[0], best_indices[1]
 
 
-def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
+def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
+                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
 
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[turn_action] winrate={winrate}")
-    return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
+    return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
+                              pot_size, my_bet, opp_bet, opp_action_probs)
 
 
-def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise, dead_cards=None):
+def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
+                 dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
 
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[river_action] winrate={winrate}")
-    return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
+    return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
+                              pot_size, my_bet, opp_bet, opp_action_probs)
 
 
 def call_function(call_amount, winrate, my_bet, max_raise):
