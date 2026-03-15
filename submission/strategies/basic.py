@@ -7,12 +7,13 @@ from treys import Card, Evaluator
 # Pool of cards that have not yet been seen (not in our hand or revealed/discarded).
 # This pool should be updated as we observe cards (our own, opponent's discards, etc.).
 remaining_card_pool: Set[int] = set(range(27))
+WINRATE_TRIALS = 10
 
 
 def reset_pool() -> None:
     """Reset the card pool to contain all cards (0-26)."""
-    global remaining_card_pool
-    remaining_card_pool = set(range(27))
+    remaining_card_pool.clear()
+    remaining_card_pool.update(range(27))
 
 
 def update_pool(seen_cards: Iterable[int]) -> None:
@@ -34,13 +35,13 @@ def predict_hand_winrate(
     my_cards: List[int],
     pool: Set[int],
     community_cards: Optional[List[int]] = None,
-    trials: int = 50,
+    trials: int = WINRATE_TRIALS,
 ) -> int:
-    """Estimate win rate of our hand against three random opponents.
+    """Estimate win rate of our hand against one random opponent.
 
     This function treats the current community cards as fixed (if provided),
     and fills up to 5 community cards by drawing from the remaining pool.
-    Then it deals 2 cards each to three opponents from the remaining deck.
+    Then it deals 2 cards to one opponent from the remaining deck.
 
     Each trial is independent: we keep our own cards fixed, and redraw the rest.
 
@@ -50,10 +51,10 @@ def predict_hand_winrate(
     """
 
     # Ensure cards are in valid range
-    my_cards = [c % 27 for c in my_cards if isinstance(c, int)]
+    my_cards = [c % 27 for c in my_cards if isinstance(c, int) and c >= 0]
     if community_cards is not None:
-        community_cards = [c % 27 for c in community_cards if isinstance(c, int)]
-    pool = {c % 27 for c in pool if isinstance(c, int)}
+        community_cards = [c % 27 for c in community_cards if isinstance(c, int) and c >= 0]
+    pool = {c % 27 for c in pool if isinstance(c, int) and c >= 0}
 
     # Only evaluate valid hold'em shape: 2 hole cards + up to 5 community cards.
     if len(my_cards) != 2:
@@ -63,8 +64,8 @@ def predict_hand_winrate(
     if set(my_cards) & set(community_cards or []):
         return 0
 
-    # Need at least 5 community + 6 opponent cards = 11 cards.
-    if len(pool) < 11:
+    # Need at least 5 community + 2 opponent cards = 7 cards.
+    if len(pool) < 7:
         return 0
 
     evaluator = Evaluator()
@@ -114,23 +115,17 @@ def predict_hand_winrate(
             board += random.sample(available, needed)
             available = [c for c in available if c not in board]
 
-        # Deal 3 opponents (2 cards each) from remaining available cards.
-        if len(available) < 6:
+        # Deal one opponent (2 cards) from remaining available cards.
+        if len(available) < 2:
             break
-        opp_cards = random.sample(available, 6)
+        opp_cards = random.sample(available, 2)
         played_trials += 1
         # Evaluate our hand.
         our_rank = evaluate_best(my_cards + board)
-
-        best_opponent_rank = float("inf")
-        for i in range(3):
-            opp_hand = opp_cards[2 * i : 2 * i + 2]
-            opp_rank = evaluate_best(opp_hand + board)
-            if opp_rank < best_opponent_rank:
-                best_opponent_rank = opp_rank
+        opp_rank = evaluate_best(opp_cards + board)
 
         # Lower rank is better
-        if our_rank < best_opponent_rank:
+        if our_rank < opp_rank:
             wins += 1
 
     if played_trials == 0:
