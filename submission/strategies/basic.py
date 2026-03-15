@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Set
 import random
+from treys import Card, Evaluator
 
 # Pool of cards that have not yet been seen (not in our hand or revealed/discarded).
 # This pool should be updated as we observe cards (our own, opponent's discards, etc.).
@@ -33,7 +34,7 @@ def predict_hand_winrate(
     my_cards: List[int],
     pool: Set[int],
     community_cards: Optional[List[int]] = None,
-    trials: int = 500,
+    trials: int = 50,
 ) -> int:
     """Estimate win rate of our hand against three random opponents.
 
@@ -48,29 +49,68 @@ def predict_hand_winrate(
     `trials`) that we win outright (ties count as non-wins).
     """
 
+    # Ensure cards are in valid range
+    my_cards = [c % 27 for c in my_cards if isinstance(c, int)]
+    if community_cards is not None:
+        community_cards = [c % 27 for c in community_cards if isinstance(c, int)]
+    pool = {c % 27 for c in pool if isinstance(c, int)}
+
+    # Only evaluate valid hold'em shape: 2 hole cards + up to 5 community cards.
+    if len(my_cards) != 2:
+        return 0
+    if community_cards is not None and len(set(community_cards)) != len(community_cards):
+        return 0
+    if set(my_cards) & set(community_cards or []):
+        return 0
+
     # Need at least 5 community + 6 opponent cards = 11 cards.
     if len(pool) < 11:
         return 0
 
-    from gym import WrappedEval
-
-    evaluator = WrappedEval()
+    evaluator = Evaluator()
 
     def evaluate_best(cards: List[int]) -> int:
-        # WrappedEval expects exactly 7 cards: 2 hole + 5 board.
-        # We pass hole+board and let it evaluate.
-        return evaluator.evaluate(cards[:2], cards[2:])
+        def int_to_card(card_int: int) -> str:
+            ranks = "23456789A"
+            suits = "dhs"
+            normalized = card_int % 27
+            rank_index = normalized % 9
+            suit_index = normalized // 9
+            return f"{ranks[rank_index]}{suits[suit_index]}"
+
+        hand_str = [int_to_card(c) for c in cards[:2]]
+        board_str = [int_to_card(c) for c in cards[2:]]
+
+        hand = [Card.new(c) for c in hand_str]
+        board = [Card.new(c) for c in board_str]
+        reg_score = evaluator.evaluate(hand, board)
+
+        # Tournament special rule: Ace can also be high in 6-7-8-9-A.
+        # We simulate that by treating A as T and taking the better score.
+        alt_hand = [Card.new(c.replace("A", "T")) for c in hand_str]
+        alt_board = [Card.new(c.replace("A", "T")) for c in board_str]
+        alt_score = evaluator.evaluate(alt_hand, alt_board)
+
+        return min(reg_score, alt_score)
 
     wins = 0
+    played_trials = 0
+    dead_cards = set(my_cards) | set(community_cards or [])
+
+    if len(dead_cards) != len(my_cards) + len(community_cards or []):
+        return 0
+
     for _ in range(trials):
         # Build community board (5 cards): use known ones, then fill randomly.
         board = []
         if community_cards is not None:
-            board = [c for c in community_cards if isinstance(c, int) and c >= 0]
+            board = [c for c in community_cards]
         # Fill to 5 cards
-        available = [c for c in pool if c not in board]
+        available = [c for c in pool if c not in dead_cards and c not in board]
         if len(board) < 5:
             needed = 5 - len(board)
+            if len(available) < needed:
+                break
             board += random.sample(available, needed)
             available = [c for c in available if c not in board]
 
@@ -78,6 +118,7 @@ def predict_hand_winrate(
         if len(available) < 6:
             break
         opp_cards = random.sample(available, 6)
+        played_trials += 1
         # Evaluate our hand.
         our_rank = evaluate_best(my_cards + board)
 
@@ -92,6 +133,9 @@ def predict_hand_winrate(
         if our_rank < best_opponent_rank:
             wins += 1
 
-    return int(wins / trials * 100)
+    if played_trials == 0:
+        return 0
+
+    return int(wins / played_trials * 100)
 
 

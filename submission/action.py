@@ -48,23 +48,33 @@ def action_from_winrate(
 
 
 def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
-    winrate = predict_hand_winrate(my_cards, remaining_card_pool)
+    valid_hole = [c for c in my_cards if c != -1]
+    if len(valid_hole) == 2:
+        winrate = predict_hand_winrate(valid_hole, remaining_card_pool, [])
+    else:
+        winrates = []
+        for combo in combinations(valid_hole, 2):
+            winrate = predict_hand_winrate(list(combo), remaining_card_pool, [])
+            winrates.append(winrate)
+        winrate = max(winrates) if winrates else 0
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
 def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
-    winrate = predict_hand_winrate(my_cards + community_cards, remaining_card_pool)
+    valid_hole = [c for c in my_cards if c != -1]
+    community = [c for c in community_cards if c != -1]
+    winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     # Similar logic to preflop, but perhaps adjust thresholds if needed
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
 def discard_action(my_cards, community_cards, remaining_card_pool):
-    # my_cards has 4 cards, community_cards has 3, find best 2 to keep
+    # my_cards has 5 cards, community_cards has 3, find best 2 to keep
     best_winrate = 0
     best_indices = (0, 1)  # default
-    for combo in combinations(range(4), 2):  # indices 0,1,2,3
-        hand = [my_cards[i] for i in combo] + community_cards
-        winrate = predict_hand_winrate(hand, remaining_card_pool)
+    for combo in combinations(range(5), 2):  # indices 0,1,2,3,4
+        hand = [my_cards[i] for i in combo]
+        winrate = predict_hand_winrate(hand, remaining_card_pool, community_cards)
         if winrate > best_winrate:
             best_winrate = winrate
             best_indices = combo
@@ -74,12 +84,16 @@ def discard_action(my_cards, community_cards, remaining_card_pool):
 
 
 def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
-    winrate = predict_hand_winrate(my_cards + community_cards, remaining_card_pool)
+    valid_hole = [c for c in my_cards if c != -1]
+    community = [c for c in community_cards if c != -1]
+    winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
 def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise):
-    winrate = predict_hand_winrate(my_cards + community_cards, remaining_card_pool)
+    valid_hole = [c for c in my_cards if c != -1]
+    community = [c for c in community_cards if c != -1]
+    winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     return action_from_winrate(winrate, valid_actions, min_raise, max_raise)
 
 
