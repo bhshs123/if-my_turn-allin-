@@ -1,10 +1,132 @@
 import os
+import math
+import random
+from collections import deque
+from dataclasses import dataclass, field
 
 from agents.agent import Agent
 from gym_env import PokerEnv
 from submission.strategies.basic import remaining_card_pool
 from submission.opponent_modeling import DBBRConfig, DBBROpponentModel
-from submission.action import preflop_action, flop_action, discard_action, turn_action, river_action
+from submission.action import (
+    ExplorationSettings,
+    preflop_action,
+    flop_action,
+    discard_action,
+    turn_action,
+    river_action,
+)
+
+
+@dataclass
+class RecentPerformanceTracker:
+    """Track match-level drift and open a short exploration window when needed."""
+
+    recent_window: int = 80
+    min_baseline_hands: int = 120
+    explore_duration: int = 30
+    cooldown_hands: int = 80
+    max_mix_probability: float = 0.10
+    min_mix_probability: float = 0.05
+    significance_z: float = 1.35
+    min_mean_drop: float = 8.0
+    recent_rewards: deque = field(init=False, repr=False)
+    total_hands: int = 0
+    total_reward: float = 0.0
+    total_reward_sq: float = 0.0
+    exploration_hands_left: int = 0
+    cooldown_hands_left: int = 0
+
+    def __post_init__(self) -> None:
+        self.recent_rewards = deque(maxlen=self.recent_window)
+
+    def _recent_mean(self) -> float:
+        if not self.recent_rewards:
+            return 0.0
+        return sum(self.recent_rewards) / len(self.recent_rewards)
+
+    def _recent_std(self) -> float:
+        if len(self.recent_rewards) < 2:
+            return 0.0
+        mean = self._recent_mean()
+        variance = sum((reward - mean) ** 2 for reward in self.recent_rewards) / len(self.recent_rewards)
+        return math.sqrt(max(0.0, variance))
+
+    def long_mean(self) -> float:
+        if self.total_hands <= 0:
+            return 0.0
+        return self.total_reward / self.total_hands
+
+    def long_std(self) -> float:
+        if self.total_hands < 2:
+            return 0.0
+        mean = self.long_mean()
+        variance = (self.total_reward_sq / self.total_hands) - (mean * mean)
+        return math.sqrt(max(0.0, variance))
+
+    def _meaningful_drop_threshold(self) -> float:
+        window_size = max(1, len(self.recent_rewards))
+        stderr = max(self.long_std(), self._recent_std()) / math.sqrt(window_size)
+        return max(self.min_mean_drop, self.significance_z * stderr)
+
+    def should_trigger(self) -> bool:
+        if self.exploration_hands_left > 0 or self.cooldown_hands_left > 0:
+            return False
+        if self.total_hands < self.min_baseline_hands:
+            return False
+        if len(self.recent_rewards) < self.recent_window:
+            return False
+
+        recent_mean = self._recent_mean()
+        long_mean = self.long_mean()
+        if recent_mean >= long_mean:
+            return False
+
+        return (long_mean - recent_mean) >= self._meaningful_drop_threshold()
+
+    def record_hand_result(self, reward: float) -> str | None:
+        """Update rolling stats once per hand and manage window/cooldown state."""
+        reward = float(reward)
+        self.total_hands += 1
+        self.total_reward += reward
+        self.total_reward_sq += reward * reward
+        self.recent_rewards.append(reward)
+
+        if self.exploration_hands_left > 0:
+            self.exploration_hands_left -= 1
+            if self.exploration_hands_left == 0:
+                self.cooldown_hands_left = self.cooldown_hands
+                return "ended"
+            return None
+
+        if self.cooldown_hands_left > 0:
+            self.cooldown_hands_left -= 1
+            return None
+
+        if self.should_trigger():
+            self.exploration_hands_left = self.explore_duration
+            return "triggered"
+        return None
+
+    def current_mix_probability(self) -> float:
+        if self.exploration_hands_left <= 0:
+            return 0.0
+        if self.explore_duration <= 1:
+            return self.min_mix_probability
+
+        progress = (self.exploration_hands_left - 1) / max(1, self.explore_duration - 1)
+        return self.min_mix_probability + progress * (self.max_mix_probability - self.min_mix_probability)
+
+    def snapshot(self) -> dict:
+        return {
+            "active": self.exploration_hands_left > 0,
+            "mix_probability": round(self.current_mix_probability(), 4),
+            "recent_mean": round(self._recent_mean(), 2),
+            "long_mean": round(self.long_mean(), 2),
+            "remaining": self.exploration_hands_left,
+            "cooldown": self.cooldown_hands_left,
+            "trigger_gap": round(self._meaningful_drop_threshold(), 2),
+        }
 
 
 class PlayerAgent(Agent):
@@ -20,6 +142,8 @@ class PlayerAgent(Agent):
             self._my_player_id = 0
         self._hand_counter = 0
         self._last_decision: dict | None = None
+        self._rng = random.Random()
+        self._exploration = RecentPerformanceTracker()
 
         # Pending public state where opponent is about to act; confirmed on next opp_last_action.
         self._pending_opp_state: dict | None = None
@@ -73,6 +197,17 @@ class PlayerAgent(Agent):
             return PokerEnv.ActionType(action_tuple[0]).name
         except Exception:
             return str(action_tuple[0])
+
+    def _current_exploration_settings(self) -> ExplorationSettings:
+        """Build the current exploration profile for the EV action layer."""
+        mix_probability = self._exploration.current_mix_probability()
+        return ExplorationSettings(
+            mix_probability=mix_probability,
+            max_candidate_actions=3,
+            ev_margin_pct=0.04,
+            ev_margin_floor=1.5,
+            raise_jitter_pct=0.06 if mix_probability > 0.0 else 0.04,
+        )
 
     def _apply_action_override(self, base_action, chosen_action_name, min_raise, max_raise, observation):
         if chosen_action_name is None:
@@ -176,12 +311,15 @@ class PlayerAgent(Agent):
         dead_cards = my_discarded + opp_discarded
 
         opp_action_probs = self._opp_action_probs(observation, legal_action_names)
+        exploration = self._current_exploration_settings()
+        exploration_status = self._exploration.snapshot()
 
         # --- Pre-flop (street 0) ---
         if street == 0:
             base_action = preflop_action(
                 my_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
                 pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
+                exploration=exploration, rng=self._rng,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
             final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
@@ -194,6 +332,7 @@ class PlayerAgent(Agent):
                 "opp_bet": opp_bet,
                 "pot": pot_size,
                 "opp_probs": dict(opp_action_probs),
+                "exploration": exploration_status,
                 "base": self._action_tuple_to_name(base_action),
                 "override": chosen,
                 "final": self._action_tuple_to_name(final_action),
@@ -210,6 +349,7 @@ class PlayerAgent(Agent):
             base_action = flop_action(
                 my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
+                exploration=exploration, rng=self._rng,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
             final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
@@ -222,6 +362,7 @@ class PlayerAgent(Agent):
                 "opp_bet": opp_bet,
                 "pot": pot_size,
                 "opp_probs": dict(opp_action_probs),
+                "exploration": exploration_status,
                 "base": self._action_tuple_to_name(base_action),
                 "override": chosen,
                 "final": self._action_tuple_to_name(final_action),
@@ -234,6 +375,7 @@ class PlayerAgent(Agent):
             base_action = turn_action(
                 my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
+                exploration=exploration, rng=self._rng,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
             final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
@@ -246,6 +388,7 @@ class PlayerAgent(Agent):
                 "opp_bet": opp_bet,
                 "pot": pot_size,
                 "opp_probs": dict(opp_action_probs),
+                "exploration": exploration_status,
                 "base": self._action_tuple_to_name(base_action),
                 "override": chosen,
                 "final": self._action_tuple_to_name(final_action),
@@ -258,6 +401,7 @@ class PlayerAgent(Agent):
             base_action = river_action(
                 my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
                 dead_cards=dead_cards, pot_size=pot_size, my_bet=my_bet, opp_bet=opp_bet, opp_action_probs=opp_action_probs,
+                exploration=exploration, rng=self._rng,
             )
             chosen = self._dbbr.select_action(observation, legal_action_names)
             final_action = self._apply_action_override(base_action, chosen, min_raise, max_raise, observation)
@@ -270,6 +414,7 @@ class PlayerAgent(Agent):
                 "opp_bet": opp_bet,
                 "pot": pot_size,
                 "opp_probs": dict(opp_action_probs),
+                "exploration": exploration_status,
                 "base": self._action_tuple_to_name(base_action),
                 "override": chosen,
                 "final": self._action_tuple_to_name(final_action),
@@ -304,4 +449,9 @@ class PlayerAgent(Agent):
             print(f"[hand_end] {summary}")
             self._hand_counter += 1
             self._dbbr.maybe_update_model(self._hand_counter)
+            event = self._exploration.record_hand_result(reward)
+            if event == "triggered":
+                print(f"[exploration] triggered {self._exploration.snapshot()}")
+            elif event == "ended":
+                print(f"[exploration] ended {self._exploration.snapshot()}")
 

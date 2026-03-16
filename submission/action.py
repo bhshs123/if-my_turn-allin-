@@ -1,3 +1,7 @@
+import random
+from dataclasses import dataclass
+from itertools import combinations
+
 from gym_env import PokerEnv
 from submission.strategies.basic import (
     predict_hand_winrate,
@@ -5,7 +9,132 @@ from submission.strategies.basic import (
     board_completion_threat,
     adjust_winrate_for_opp_bet,
 )
-from itertools import combinations
+
+
+@dataclass(frozen=True)
+class ExplorationSettings:
+    """Small bounded-variance layer over the deterministic EV policy.
+
+    `mix_probability` controls whether we occasionally sample among near-equal EV
+    actions. `raise_jitter_pct` adds a mild amount of raise-size variation around
+    the existing winrate-based sizing curve.
+    """
+
+    mix_probability: float = 0.0
+    max_candidate_actions: int = 3
+    ev_margin_pct: float = 0.04
+    ev_margin_floor: float = 1.5
+    raise_jitter_pct: float = 0.05
+
+
+def _clamp_float(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, value))
+
+
+def _raise_fraction_for_winrate(winrate: int) -> float:
+    if winrate > 80:
+        return 0.20
+    if winrate > 70:
+        return 0.15
+    return 0.12
+
+
+def _base_raise_amount(winrate: int, min_raise: int, max_raise: int) -> int:
+    target = int(max_raise * _raise_fraction_for_winrate(winrate))
+    return _clamp_int(max(min_raise, target), min_raise, max_raise)
+
+
+def randomized_raise_amount(
+    base_raise: int,
+    min_raise: int,
+    max_raise: int,
+    exploration: ExplorationSettings | None = None,
+    rng=None,
+) -> int:
+    """Add a small amount of bounded raise-size variation around the base size."""
+    if max_raise < min_raise:
+        return base_raise
+
+    settings = exploration or ExplorationSettings()
+    jitter_pct = max(0.0, float(settings.raise_jitter_pct))
+    base_raise = _clamp_int(base_raise, min_raise, max_raise)
+    if jitter_pct <= 0.0:
+        return base_raise
+
+    jitter_span = max(1, int(round(base_raise * jitter_pct)))
+    low = max(min_raise, base_raise - jitter_span)
+    high = min(max_raise, base_raise + jitter_span)
+    if high <= low:
+        return low
+
+    chooser = rng if rng is not None else random
+    return chooser.randint(low, high)
+
+
+def exploration_candidates(
+    evs: dict[str, float],
+    pot: int,
+    exploration: ExplorationSettings | None = None,
+) -> list[tuple[str, float]]:
+    """Return only sensible near-optimal actions for optional exploration mixing."""
+    if not evs:
+        return []
+
+    settings = exploration or ExplorationSettings()
+    ranked = sorted(evs.items(), key=lambda item: item[1], reverse=True)
+    best_action, best_ev = ranked[0]
+
+    # Never turn a strong fold into a loose gamble.
+    if best_action == "FOLD":
+        return [ranked[0]]
+
+    margin = max(float(settings.ev_margin_floor), float(max(1, pot)) * float(settings.ev_margin_pct))
+    lower_bound = best_ev - margin
+    if best_ev > 0.0:
+        lower_bound = max(0.0, lower_bound)
+
+    candidates = [item for item in ranked if item[1] >= lower_bound]
+    return candidates[: max(1, int(settings.max_candidate_actions))]
+
+
+def select_action_with_exploration(
+    evs: dict[str, float],
+    pot: int,
+    exploration: ExplorationSettings | None = None,
+    rng=None,
+) -> tuple[str, list[tuple[str, float]]]:
+    """Choose the best EV action, with rare mixing among near-equal candidates."""
+    if not evs:
+        raise ValueError("evs must contain at least one legal action")
+
+    settings = exploration or ExplorationSettings()
+    candidates = exploration_candidates(evs, pot=pot, exploration=settings)
+    best_action = candidates[0][0]
+
+    mix_probability = _clamp_float(float(settings.mix_probability), 0.0, 1.0)
+    if mix_probability <= 0.0 or len(candidates) < 2:
+        return best_action, candidates
+
+    chooser = rng if rng is not None else random
+    if chooser.random() >= mix_probability:
+        return best_action, candidates
+
+    best_ev = candidates[0][1]
+    margin = max(float(settings.ev_margin_floor), float(max(1, pot)) * float(settings.ev_margin_pct))
+    weights = [max(0.01, margin - (best_ev - ev) + 0.01) for _, ev in candidates]
+    total_weight = sum(weights)
+    threshold = chooser.random() * total_weight
+
+    cumulative = 0.0
+    for (action_name, _), weight in zip(candidates, weights):
+        cumulative += weight
+        if threshold <= cumulative:
+            return action_name, candidates
+    return candidates[-1][0], candidates
 
 
 def _refresh_remaining_pool(remaining_card_pool, valid_hole, valid_community=None, extra_dead=None):
@@ -35,6 +164,8 @@ def ev_action_decision(
     opp_action_probs: dict,
     street: int,
     board_threat: float = 0.0,
+    exploration: ExplorationSettings | None = None,
+    rng=None,
 ) -> tuple:
     """EV-based fold/call/raise/check decision (game tree spec, Sections 4-5).
 
@@ -90,21 +221,13 @@ def ev_action_decision(
         raise_discount = min(0.35, 0.18 * pressure)
         p_win_raise = p_win * (1.0 - raise_discount)
 
-    raise_r = max(min_raise, int(max_raise * 0.12))
-    chips_in = call_amount + raise_r
-    showdown_pot = pot + call_amount + 2 * raise_r
+    raise_r_base = _base_raise_amount(winrate, min_raise, max_raise)
+    chips_in = call_amount + raise_r_base
+    showdown_pot = pot + call_amount + 2 * raise_r_base
     ev_raise = (
         p_opp_fold * pot
         + p_opp_continues * (p_win_raise * showdown_pot - chips_in)
     )
-
-    # Final raise sizing: scale bet with hand strength
-    if winrate > 80:
-        raise_r_final = max(min_raise, int(max_raise * 0.20))
-    elif winrate > 70:
-        raise_r_final = max(min_raise, int(max_raise * 0.15))
-    else:
-        raise_r_final = max(min_raise, int(max_raise * 0.12))
 
     # Build EV map over valid actions
     evs = {}
@@ -149,7 +272,12 @@ def ev_action_decision(
     if can_check and "FOLD" in evs:
         evs.pop("FOLD")
 
-    best = max(evs, key=lambda a: evs[a])
+    best, candidates = select_action_with_exploration(
+        evs,
+        pot=pot,
+        exploration=exploration,
+        rng=rng,
+    )
 
     # Near breakeven calls are sensitive to simulation/model noise.
     # Only apply anti-overfold in early/small-pot situations.
@@ -159,10 +287,20 @@ def ev_action_decision(
         if street <= 1 and small_call and ev_call >= -noise_margin:
             best = "CALL"
 
+    raise_r_final = randomized_raise_amount(
+        raise_r_base,
+        min_raise=min_raise,
+        max_raise=max_raise,
+        exploration=exploration,
+        rng=rng,
+    )
+
     print(
         f"[ev] street={street} winrate={winrate} call={call_amount} pot={pot} "
         f"p_opp_fold={p_opp_fold:.2f} "
-        f"EV(fold)={ev_fold:.1f} EV(call/chk)={ev_call:.1f} EV(raise)={ev_raise:.1f} -> {best}"
+        f"EV(fold)={ev_fold:.1f} EV(call/chk)={ev_call:.1f} EV(raise)={ev_raise:.1f} "
+        f"mix_p={(exploration.mix_probability if exploration else 0.0):.2f} "
+        f"candidates={[(name, round(ev, 2)) for name, ev in candidates]} -> {best}"
     )
 
     if best == "RAISE":
@@ -175,7 +313,8 @@ def ev_action_decision(
 
 
 def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
-                   pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
+                   pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None,
+                   exploration: ExplorationSettings | None = None, rng=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole)
 
@@ -189,11 +328,13 @@ def preflop_action(my_cards, remaining_card_pool, valid_actions, min_raise, max_
         winrate = max(winrates) if winrates else 0
     print(f"[preflop_action] winrate={winrate}")
     return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
-                              pot_size, my_bet, opp_bet, opp_action_probs, street=0)
+                              pot_size, my_bet, opp_bet, opp_action_probs, street=0,
+                              exploration=exploration, rng=rng)
 
 
 def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
-                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
+                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None,
+                exploration: ExplorationSettings | None = None, rng=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
@@ -201,7 +342,8 @@ def flop_action(my_cards, community_cards, remaining_card_pool, valid_actions, m
     winrate = predict_hand_winrate(valid_hole, remaining_card_pool, community)
     print(f"[flop_action] winrate={winrate}")
     return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
-                              pot_size, my_bet, opp_bet, opp_action_probs, street=1)
+                              pot_size, my_bet, opp_bet, opp_action_probs, street=1,
+                              exploration=exploration, rng=rng)
 
 
 def discard_action(my_cards, community_cards, remaining_card_pool, dead_cards=None):
@@ -223,7 +365,8 @@ def discard_action(my_cards, community_cards, remaining_card_pool, dead_cards=No
 
 
 def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
-                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
+                dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None,
+                exploration: ExplorationSettings | None = None, rng=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
@@ -235,11 +378,13 @@ def turn_action(my_cards, community_cards, remaining_card_pool, valid_actions, m
     threat = board_completion_threat(community)
     print(f"[turn_action] winrate={winrate} raw={raw_winrate} opp_raise={opp_raise} threat={threat:.2f}")
     return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
-                              pot_size, my_bet, opp_bet, opp_action_probs, street=2, board_threat=threat)
+                              pot_size, my_bet, opp_bet, opp_action_probs, street=2, board_threat=threat,
+                              exploration=exploration, rng=rng)
 
 
 def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, min_raise, max_raise,
-                 dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None):
+                 dead_cards=None, pot_size=0, my_bet=0, opp_bet=0, opp_action_probs=None,
+                 exploration: ExplorationSettings | None = None, rng=None):
     valid_hole = [c for c in my_cards if isinstance(c, int) and c >= 0]
     community = [c for c in community_cards if isinstance(c, int) and c >= 0]
     _refresh_remaining_pool(remaining_card_pool, valid_hole, community, extra_dead=dead_cards)
@@ -251,7 +396,8 @@ def river_action(my_cards, community_cards, remaining_card_pool, valid_actions, 
     threat = board_completion_threat(community)
     print(f"[river_action] winrate={winrate} raw={raw_winrate} opp_raise={opp_raise} threat={threat:.2f}")
     return ev_action_decision(winrate, valid_actions, min_raise, max_raise,
-                              pot_size, my_bet, opp_bet, opp_action_probs, street=3, board_threat=threat)
+                              pot_size, my_bet, opp_bet, opp_action_probs, street=3, board_threat=threat,
+                              exploration=exploration, rng=rng)
 
 
 def call_function(call_amount, winrate, my_bet, max_raise):
