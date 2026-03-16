@@ -22,10 +22,10 @@ from submission.action import (
 class RecentPerformanceTracker:
     """Track match-level drift and open a short exploration window when needed."""
 
-    recent_window: int = 80
-    min_baseline_hands: int = 120
-    explore_duration: int = 30
-    cooldown_hands: int = 80
+    recent_window: int = 50
+    min_baseline_hands: int = 50
+    explore_duration: int = 50
+    cooldown_hands: int = 25
     max_mix_probability: float = 0.10
     min_mix_probability: float = 0.05
     significance_z: float = 1.35
