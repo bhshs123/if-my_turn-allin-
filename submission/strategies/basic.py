@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Iterable, List, Optional, Set
 import random
+from itertools import combinations
 from treys import Card, Evaluator
 
 # Module-level evaluator singleton (shared across helpers to avoid re-init overhead).
@@ -12,6 +13,9 @@ _TREYS_EVAL = Evaluator()
 # This pool should be updated as we observe cards (our own, opponent's discards, etc.).
 remaining_card_pool: Set[int] = set(range(27))
 WINRATE_TRIALS = 100
+_CARD_STR = ["23456789A"[i % 9] + "dhs"[i // 9] for i in range(27)]
+_TREYS_CARD = [Card.new(s) for s in _CARD_STR]
+_TREYS_CARD_ALT = [Card.new(s.replace("A", "T")) for s in _CARD_STR]
 
 
 def reset_pool() -> None:
@@ -54,11 +58,12 @@ def predict_hand_winrate(
     `trials`) that we win outright (ties count as non-wins).
     """
 
-    # Ensure cards are in valid range
-    my_cards = [c % 27 for c in my_cards if isinstance(c, int) and c >= 0]
+    # Keep only in-range cards; avoid modulo aliasing that can introduce
+    # duplicated logical cards and crash the evaluator.
+    my_cards = [c for c in my_cards if isinstance(c, int) and 0 <= c < 27]
     if community_cards is not None:
-        community_cards = [c % 27 for c in community_cards if isinstance(c, int) and c >= 0]
-    pool = {c % 27 for c in pool if isinstance(c, int) and c >= 0}
+        community_cards = [c for c in community_cards if isinstance(c, int) and 0 <= c < 27]
+    pool = {c for c in pool if isinstance(c, int) and 0 <= c < 27}
 
     # Only evaluate valid hold'em shape: 2 hole cards + up to 5 community cards.
     if len(my_cards) != 2:
@@ -72,31 +77,19 @@ def predict_hand_winrate(
     if len(pool) < 7:
         return 0
 
-    evaluator = Evaluator()
-
     def evaluate_best(cards: List[int]) -> int:
-        def int_to_card(card_int: int) -> str:
-            ranks = "23456789A"
-            suits = "dhs"
-            normalized = card_int % 27
-            rank_index = normalized % 9
-            suit_index = normalized // 9
-            return f"{ranks[rank_index]}{suits[suit_index]}"
-
-        hand_str = [int_to_card(c) for c in cards[:2]]
-        board_str = [int_to_card(c) for c in cards[2:]]
-
-        hand = [Card.new(c) for c in hand_str]
-        board = [Card.new(c) for c in board_str]
-        reg_score = evaluator.evaluate(hand, board)
-
-        # Tournament special rule: Ace can also be high in 6-7-8-9-A.
-        # We simulate that by treating A as T and taking the better score.
-        alt_hand = [Card.new(c.replace("A", "T")) for c in hand_str]
-        alt_board = [Card.new(c.replace("A", "T")) for c in board_str]
-        alt_score = evaluator.evaluate(alt_hand, alt_board)
-
-        return min(reg_score, alt_score)
+        # Duplicates are invalid in poker and can produce unsupported lookup
+        # keys in treys. Return a very weak score instead of raising.
+        if len(set(cards)) != len(cards):
+            return 10_000
+        hand = cards[:2]
+        board = cards[2:]
+        try:
+            reg_score = _TREYS_EVAL.evaluate([_TREYS_CARD[c] for c in hand], [_TREYS_CARD[c] for c in board])
+            alt_score = _TREYS_EVAL.evaluate([_TREYS_CARD_ALT[c] for c in hand], [_TREYS_CARD_ALT[c] for c in board])
+            return min(reg_score, alt_score)
+        except KeyError:
+            return 10_000
 
     wins = 0
     played_trials = 0
@@ -104,6 +97,40 @@ def predict_hand_winrate(
 
     if len(dead_cards) != len(my_cards) + len(community_cards or []):
         return 0
+
+    # Turn can also be evaluated exactly with one future board card and all
+    # opponent combinations. This reduces variance in expensive late-street spots.
+    if community_cards is not None and len(community_cards) == 4:
+        board = list(community_cards)
+        available = [c for c in pool if c not in dead_cards and c not in board]
+        if len(available) < 3:
+            return 0
+        total = 0
+        for river in available:
+            full_board = board + [river]
+            remain = [c for c in available if c != river]
+            our_rank = evaluate_best(my_cards + full_board)
+            for o1, o2 in combinations(remain, 2):
+                total += 1
+                opp_rank = evaluate_best([o1, o2] + full_board)
+                if our_rank < opp_rank:
+                    wins += 1
+        return int(wins / total * 100) if total > 0 else 0
+
+    # River can be evaluated exactly (all opponent 2-card combinations).
+    if community_cards is not None and len(community_cards) == 5:
+        board = list(community_cards)
+        available = [c for c in pool if c not in dead_cards and c not in board]
+        if len(available) < 2:
+            return 0
+        our_rank = evaluate_best(my_cards + board)
+        total = 0
+        for o1, o2 in combinations(available, 2):
+            total += 1
+            opp_rank = evaluate_best([o1, o2] + board)
+            if our_rank < opp_rank:
+                wins += 1
+        return int(wins / total * 100) if total > 0 else 0
 
     for _ in range(trials):
         # Build community board (5 cards): use known ones, then fill randomly.
@@ -136,6 +163,28 @@ def predict_hand_winrate(
         return 0
 
     return int(wins / played_trials * 100)
+
+
+def hand_rank_class(hole_cards: List[int], community_cards: List[int]) -> int:
+    """Return treys rank class for the current best hand. Lower is stronger.
+
+    Class values are those returned by treys Evaluator.get_rank_class, where
+    straight flush is strongest and high card is weakest.
+    """
+    valid_hole = [c for c in hole_cards if isinstance(c, int) and 0 <= c < 27]
+    valid_board = [c for c in community_cards if isinstance(c, int) and 0 <= c < 27]
+    if len(valid_hole) != 2 or not (3 <= len(valid_board) <= 5):
+        return 9
+    if len(set(valid_hole + valid_board)) != len(valid_hole) + len(valid_board):
+        return 9
+
+    try:
+        reg_score = _TREYS_EVAL.evaluate([_TREYS_CARD[c] for c in valid_hole], [_TREYS_CARD[c] for c in valid_board])
+        alt_score = _TREYS_EVAL.evaluate([_TREYS_CARD_ALT[c] for c in valid_hole], [_TREYS_CARD_ALT[c] for c in valid_board])
+        best_score = min(reg_score, alt_score)
+        return int(_TREYS_EVAL.get_rank_class(best_score))
+    except KeyError:
+        return 9
 
 
 def board_completion_threat(community_cards: List[int]) -> float:
@@ -227,12 +276,20 @@ def _eval_best_treys_score(hole_ints: List[int], board_ints: List[int]) -> int:
 
     hand_s = [_to_str(c) for c in hole_ints]
     board_s = [_to_str(c) for c in board_ints]
+    if len(set(hand_s + board_s)) != len(hand_s) + len(board_s):
+        return 10_000
     hand = [Card.new(c) for c in hand_s]
     board = [Card.new(c) for c in board_s]
-    reg = _TREYS_EVAL.evaluate(hand, board)
+    try:
+        reg = _TREYS_EVAL.evaluate(hand, board)
+    except KeyError:
+        reg = 10_000
     alt_h = [Card.new(c.replace("A", "T")) for c in hand_s]
     alt_b = [Card.new(c.replace("A", "T")) for c in board_s]
-    alt = _TREYS_EVAL.evaluate(alt_h, alt_b)
+    try:
+        alt = _TREYS_EVAL.evaluate(alt_h, alt_b)
+    except KeyError:
+        alt = 10_000
     return min(reg, alt)
 
 
