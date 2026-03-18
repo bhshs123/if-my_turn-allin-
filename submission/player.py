@@ -1,12 +1,11 @@
+import numbers
 import os
-import math
 import random
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Optional
 
 from agents.agent import Agent
 from gym_env import PokerEnv
+from submission.anti_predict import AntiPredictTracker
+from submission.exploration import RecentPerformanceTracker
 from submission.strategies.basic import remaining_card_pool
 from submission.opponent_modeling import DBBRConfig, DBBROpponentModel
 from submission.action import (
@@ -18,265 +17,10 @@ from submission.action import (
     river_action,
 )
 
-
-@dataclass
-class RecentPerformanceTracker:
-    """Track match-level drift and open a short exploration window when needed."""
-
-    recent_window: int = 50
-    min_baseline_hands: int = 50
-    explore_duration: int = 50
-    cooldown_hands: int = 25
-    max_mix_probability: float = 0.10
-    min_mix_probability: float = 0.05
-    baseline_mix_probability: float = 0.025
-    significance_z: float = 1.35
-    min_mean_drop: float = 8.0
-    recent_rewards: deque = field(init=False, repr=False)
-    total_hands: int = 0
-    total_reward: float = 0.0
-    total_reward_sq: float = 0.0
-    exploration_hands_left: int = 0
-    cooldown_hands_left: int = 0
-
-    def __post_init__(self) -> None:
-        self.recent_rewards = deque(maxlen=self.recent_window)
-
-    def _recent_mean(self) -> float:
-        if not self.recent_rewards:
-            return 0.0
-        return sum(self.recent_rewards) / len(self.recent_rewards)
-
-    def _recent_std(self) -> float:
-        if len(self.recent_rewards) < 2:
-            return 0.0
-        mean = self._recent_mean()
-        variance = sum((reward - mean) ** 2 for reward in self.recent_rewards) / len(self.recent_rewards)
-        return math.sqrt(max(0.0, variance))
-
-    def long_mean(self) -> float:
-        if self.total_hands <= 0:
-            return 0.0
-        return self.total_reward / self.total_hands
-
-    def long_std(self) -> float:
-        if self.total_hands < 2:
-            return 0.0
-        mean = self.long_mean()
-        variance = (self.total_reward_sq / self.total_hands) - (mean * mean)
-        return math.sqrt(max(0.0, variance))
-
-    def _meaningful_drop_threshold(self) -> float:
-        window_size = max(1, len(self.recent_rewards))
-        stderr = max(self.long_std(), self._recent_std()) / math.sqrt(window_size)
-        return max(self.min_mean_drop, self.significance_z * stderr)
-
-    def should_trigger(self) -> bool:
-        if self.exploration_hands_left > 0 or self.cooldown_hands_left > 0:
-            return False
-        if self.total_hands < self.min_baseline_hands:
-            return False
-        if len(self.recent_rewards) < self.recent_window:
-            return False
-
-        recent_mean = self._recent_mean()
-        long_mean = self.long_mean()
-        if recent_mean >= long_mean:
-            return False
-
-        return (long_mean - recent_mean) >= self._meaningful_drop_threshold()
-
-    def record_hand_result(self, reward: float) -> str | None:
-        """Update rolling stats once per hand and manage window/cooldown state."""
-        reward = float(reward)
-        self.total_hands += 1
-        self.total_reward += reward
-        self.total_reward_sq += reward * reward
-        self.recent_rewards.append(reward)
-
-        if self.exploration_hands_left > 0:
-            self.exploration_hands_left -= 1
-            if self.exploration_hands_left == 0:
-                self.cooldown_hands_left = self.cooldown_hands
-                return "ended"
-            return None
-
-        if self.cooldown_hands_left > 0:
-            self.cooldown_hands_left -= 1
-            return None
-
-        if self.should_trigger():
-            self.exploration_hands_left = self.explore_duration
-            return "triggered"
-        return None
-
-    def current_mix_probability(self) -> float:
-        if self.exploration_hands_left <= 0:
-            return self.baseline_mix_probability
-        if self.explore_duration <= 1:
-            return max(self.min_mix_probability, self.baseline_mix_probability)
-
-        progress = (self.exploration_hands_left - 1) / max(1, self.explore_duration - 1)
-        burst = self.min_mix_probability + progress * (self.max_mix_probability - self.min_mix_probability)
-        return max(self.baseline_mix_probability, burst)
-
-    def snapshot(self) -> dict:
-        return {
-            "active": self.exploration_hands_left > 0,
-            "mix_probability": round(self.current_mix_probability(), 4),
-            "recent_mean": round(self._recent_mean(), 2),
-            "long_mean": round(self.long_mean(), 2),
-            "remaining": self.exploration_hands_left,
-            "cooldown": self.cooldown_hands_left,
-            "trigger_gap": round(self._meaningful_drop_threshold(), 2),
-        }
-
-    def risk_off(self) -> bool:
-        """Tighten aggression when recent performance is meaningfully below baseline."""
-        if self.total_hands < 24 or len(self.recent_rewards) < min(12, self.recent_window):
-            return False
-        recent = self._recent_mean()
-        long = self.long_mean()
-        return (recent < -4.0) or ((long - recent) >= max(6.0, self._meaningful_drop_threshold() * 0.8))
-
-
-@dataclass(frozen=True)
-class NodeTargetProfile:
-    targets: dict[str, float]
-    strength: float
-    window: int = 72
-
-
-@dataclass(frozen=True)
-class NodeSizingProfile:
-    targets: dict[str, float]
-    strength: float
-
-
-class AntiPredictTracker:
-    """Keep key public nodes near target action frequencies.
-
-    This is a lightweight first-phase anti-exploit layer: it does not replace the
-    EV policy, it only nudges near-marginal spots back toward a mixed strategy.
-    """
-
-    def __init__(self) -> None:
-        self._profiles = {
-            "preflop_unopened": NodeTargetProfile({"RAISE": 0.38, "CALL": 0.62}, strength=0.85),
-            "flop_check_to_us": NodeTargetProfile({"RAISE": 0.56, "CHECK": 0.44}, strength=0.90),
-            "turn_check_to_us": NodeTargetProfile({"RAISE": 0.42, "CHECK": 0.58}, strength=0.75),
-            "river_check_to_us": NodeTargetProfile({"RAISE": 0.28, "CHECK": 0.72}, strength=0.55),
-            "facing_turn_raise": NodeTargetProfile({"CALL": 0.24, "FOLD": 0.76}, strength=0.70),
-            "facing_river_raise": NodeTargetProfile({"CALL": 0.12, "FOLD": 0.88}, strength=0.60),
-        }
-        self._sizing_profiles = {
-            "preflop_unopened": NodeSizingProfile({"small": 0.52, "standard": 0.34, "pressure": 0.14}, strength=0.55),
-            "flop_check_to_us": NodeSizingProfile({"small": 0.24, "standard": 0.50, "pressure": 0.26}, strength=0.75),
-            "turn_check_to_us": NodeSizingProfile({"small": 0.18, "standard": 0.50, "pressure": 0.32}, strength=0.70),
-            "river_check_to_us": NodeSizingProfile({"small": 0.44, "standard": 0.40, "pressure": 0.16}, strength=0.45),
-        }
-        self._history = {
-            key: deque(maxlen=profile.window) for key, profile in self._profiles.items()
-        }
-
-    def identify_node(self, observation, legal_actions) -> Optional[str]:
-        street = int(observation.get("street", -1))
-        my_bet = int(observation.get("my_bet", 0))
-        opp_bet = int(observation.get("opp_bet", 0))
-        opp_last_action = str(observation.get("opp_last_action", "None"))
-        legal = set(legal_actions)
-
-        if street == 0 and "RAISE" in legal and opp_bet <= my_bet:
-            return "preflop_unopened"
-
-        if street == 1 and opp_bet == my_bet and opp_last_action == "CHECK" and "RAISE" in legal:
-            return "flop_check_to_us"
-        if street == 2 and opp_bet == my_bet and opp_last_action == "CHECK" and "RAISE" in legal:
-            return "turn_check_to_us"
-        if street == 3 and opp_bet == my_bet and opp_last_action == "CHECK" and "RAISE" in legal:
-            return "river_check_to_us"
-        if street == 2 and opp_bet > my_bet and "CALL" in legal and "FOLD" in legal:
-            return "facing_turn_raise"
-        if street == 3 and opp_bet > my_bet and "CALL" in legal and "FOLD" in legal:
-            return "facing_river_raise"
-        return None
-
-    def _normalize_targets(self, node_key: str, legal_actions, observation) -> dict[str, float]:
-        profile = self._profiles[node_key]
-        legal = set(legal_actions)
-        mapped: dict[str, float] = {}
-        for action_name, prob in profile.targets.items():
-            resolved = action_name
-            if action_name == "CALL" and "CALL" not in legal and "CHECK" in legal:
-                resolved = "CHECK"
-            elif action_name == "CHECK" and "CHECK" not in legal and "CALL" in legal and int(observation.get("opp_bet", 0)) <= int(observation.get("my_bet", 0)):
-                resolved = "CALL"
-            if resolved not in legal:
-                continue
-            mapped[resolved] = mapped.get(resolved, 0.0) + prob
-
-        total = sum(mapped.values())
-        if total <= 0.0:
-            return {}
-        return {action_name: prob / total for action_name, prob in mapped.items()}
-
-    def _observed_distribution(self, node_key: str, actions: list[str]) -> dict[str, float]:
-        history = self._history[node_key]
-        if not history:
-            uniform = 1.0 / max(1, len(actions))
-            return {action_name: uniform for action_name in actions}
-
-        counts = {action_name: 0 for action_name in actions}
-        hits = 0
-        for action_name in history:
-            if action_name in counts:
-                counts[action_name] += 1
-                hits += 1
-        if hits == 0:
-            uniform = 1.0 / max(1, len(actions))
-            return {action_name: uniform for action_name in actions}
-        return {action_name: counts[action_name] / hits for action_name in actions}
-
-    def build_context(self, observation, legal_actions, pot_size: int) -> Optional[dict]:
-        node_key = self.identify_node(observation, legal_actions)
-        if not node_key:
-            return None
-
-        targets = self._normalize_targets(node_key, legal_actions, observation)
-        if not targets:
-            return None
-
-        observed = self._observed_distribution(node_key, list(targets.keys()))
-        profile = self._profiles[node_key]
-        scale = max(1.2, 0.06 * max(1, int(pot_size)))
-        cap = max(1.0, 0.12 * max(1, int(pot_size)))
-        biases: dict[str, float] = {}
-        for action_name, target in targets.items():
-            gap = target - observed.get(action_name, 0.0)
-            bias = max(-cap, min(cap, gap * profile.strength * scale))
-            if abs(bias) >= 0.08:
-                biases[action_name] = bias
-
-        sizing = None
-        sizing_profile = self._sizing_profiles.get(node_key)
-        if sizing_profile and "RAISE" in set(legal_actions):
-            sizing = {
-                "weights": dict(sizing_profile.targets),
-                "strength": sizing_profile.strength,
-            }
-
-        return {
-            "node": node_key,
-            "targets": targets,
-            "observed": observed,
-            "biases": biases,
-            "sizing": sizing,
-        }
-
-    def record_action(self, node_key: Optional[str], action_name: str) -> None:
-        if not node_key or node_key not in self._history:
-            return
-        self._history[node_key].append(action_name)
+# Re-export so existing external imports like
+#   from submission.player import RecentPerformanceTracker
+# continue to work without modification.
+__all__ = ["PlayerAgent", "RecentPerformanceTracker"]
 
 
 class PlayerAgent(Agent):
@@ -346,7 +90,7 @@ class PlayerAgent(Agent):
     def _fmt_cards(self, cards):
         out = []
         for card in cards or []:
-            if isinstance(card, int) and card >= 0:
+            if isinstance(card, numbers.Integral) and card >= 0:
                 try:
                     out.append(PokerEnv.int_to_card(card))
                 except Exception:
@@ -550,8 +294,8 @@ class PlayerAgent(Agent):
         opp_bet = observation.get("opp_bet", 0)
         pot_size = observation.get("pot_size", 0)
         # Collect known-discarded cards so the pool excludes them from simulation.
-        my_discarded = [c for c in observation.get("my_discarded_cards", []) if isinstance(c, int) and c >= 0]
-        opp_discarded = [c for c in observation.get("opp_discarded_cards", []) if isinstance(c, int) and c >= 0]
+        my_discarded = [int(c) for c in observation.get("my_discarded_cards", []) if isinstance(c, numbers.Integral) and c >= 0]
+        opp_discarded = [int(c) for c in observation.get("opp_discarded_cards", []) if isinstance(c, numbers.Integral) and c >= 0]
         dead_cards = my_discarded + opp_discarded
 
         opp_action_probs = self._opp_action_probs(observation, legal_action_names)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from typing import Iterable, List, Optional, Set
+import numbers
 import random
 from itertools import combinations
 from treys import Card, Evaluator
@@ -35,7 +36,7 @@ def update_pool(seen_cards: Iterable[int]) -> None:
     for c in seen_cards:
         if c is None:
             continue
-        if isinstance(c, int) and 0 <= c < 27:
+        if isinstance(c, numbers.Integral) and 0 <= c < 27:
             remaining_card_pool.discard(c)
 
 
@@ -60,10 +61,10 @@ def predict_hand_winrate(
 
     # Keep only in-range cards; avoid modulo aliasing that can introduce
     # duplicated logical cards and crash the evaluator.
-    my_cards = [c for c in my_cards if isinstance(c, int) and 0 <= c < 27]
+    my_cards = [c for c in my_cards if isinstance(c, numbers.Integral) and 0 <= c < 27]
     if community_cards is not None:
-        community_cards = [c for c in community_cards if isinstance(c, int) and 0 <= c < 27]
-    pool = {c for c in pool if isinstance(c, int) and 0 <= c < 27}
+        community_cards = [c for c in community_cards if isinstance(c, numbers.Integral) and 0 <= c < 27]
+    pool = {c for c in pool if isinstance(c, numbers.Integral) and 0 <= c < 27}
 
     # Only evaluate valid hold'em shape: 2 hole cards + up to 5 community cards.
     if len(my_cards) != 2:
@@ -171,8 +172,8 @@ def hand_rank_class(hole_cards: List[int], community_cards: List[int]) -> int:
     Class values are those returned by treys Evaluator.get_rank_class, where
     straight flush is strongest and high card is weakest.
     """
-    valid_hole = [c for c in hole_cards if isinstance(c, int) and 0 <= c < 27]
-    valid_board = [c for c in community_cards if isinstance(c, int) and 0 <= c < 27]
+    valid_hole = [c for c in hole_cards if isinstance(c, numbers.Integral) and 0 <= c < 27]
+    valid_board = [c for c in community_cards if isinstance(c, numbers.Integral) and 0 <= c < 27]
     if len(valid_hole) != 2 or not (3 <= len(valid_board) <= 5):
         return 9
     if len(set(valid_hole + valid_board)) != len(valid_hole) + len(valid_board):
@@ -193,7 +194,7 @@ def board_completion_threat(community_cards: List[int]) -> float:
     Higher values mean the board is more dangerous — the new card on turn/river
     is more likely to have completed a strong hand for a raising opponent.
     """
-    valid = [c for c in community_cards if isinstance(c, int) and 0 <= c < 27]
+    valid = [c for c in community_cards if isinstance(c, numbers.Integral) and 0 <= c < 27]
     if len(valid) < 3:
         return 0.0
 
@@ -234,6 +235,7 @@ def adjust_winrate_for_opp_bet(
     opp_street_raise: int,
     pot_before: int,
     community_cards: Optional[List[int]] = None,
+    street: int = 1,
 ) -> int:
     """Adjust our winrate estimate downward based on opponent aggression + board texture.
 
@@ -253,8 +255,11 @@ def adjust_winrate_for_opp_bet(
     aggression = min(1.0, opp_street_raise / max(1, pot_before))
     danger = board_completion_threat(community_cards or [])
 
-    # Base 20% down at max aggression; board danger adds up to 15% more
-    penalty = aggression * (0.20 + 0.15 * danger)
+    # Base 28% down at max aggression; board danger adds up to 18% more
+    penalty = aggression * (0.28 + 0.18 * danger)
+    # River: additional flat 14% range discount (opponent's bet range is stronger on showdown street)
+    if street >= 3:
+        penalty = min(0.80, penalty + 0.14)
     return max(0, int(winrate * (1.0 - penalty)))
 
 

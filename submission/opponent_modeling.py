@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+import numbers
 import random
 
 
@@ -106,7 +107,7 @@ class PublicStateEncoder:
 
     def encode_public_state(self, observation: Mapping[str, Any], actor: str = "opponent") -> PublicKey:
         street = int(observation.get("street", -1))
-        board = tuple(int(c) for c in observation.get("community_cards", []) if isinstance(c, int) and c >= 0)
+        board = tuple(int(c) for c in observation.get("community_cards", []) if isinstance(c, numbers.Integral) and c >= 0)
         pot_bucket = _bucketize_value(int(observation.get("pot_size", 0)), step=10, max_value=200)
         opp_bet_bucket = _bucketize_value(int(observation.get("opp_bet", 0)), step=10, max_value=100)
         blind_pos = int(observation.get("blind_position", -1))

@@ -11,5 +11,10 @@ How to use:
 2. In chat, send `continue` or `next`.
 3. Copilot should pick the first `pending` task, do it, update the task status, and append an event.
 
+Suggested queue scope:
+- Anti-predict phase-one tuning.
+- Anti-predict phase-two sizing work.
+- Modular refactors under `submission/` to make later implementation easier.
+
 Limitation:
 Copilot cannot start a new turn without a new prompt from you. The queue can be consumed automatically on the next prompt, but not fully unattended without further prompts.
