@@ -216,6 +216,10 @@ def exploration_candidates(
         lower_bound = max(0.0, lower_bound)
 
     candidates = [item for item in ranked if item[1] >= lower_bound]
+    if best_action != "FOLD":
+        # Exploration can mix among near-equal non-fold lines, but should not
+        # randomly turn a best check/call/raise into a fold.
+        candidates = [item for item in candidates if item[0] != "FOLD"]
     return candidates[: max(1, int(settings.max_candidate_actions))]
 
 

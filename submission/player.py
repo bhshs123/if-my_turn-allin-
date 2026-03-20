@@ -217,6 +217,14 @@ class PlayerAgent(Agent):
                 return base_action
 
         if chosen_action_name == "RAISE":
+            raise_id = PokerEnv.ActionType.RAISE.value
+            if (
+                raise_id >= len(valid_actions)
+                or not valid_actions[raise_id]
+                or max_raise < min_raise
+                or min_raise <= 0
+            ):
+                return base_action
             amt = max(min_raise, int(max_raise * 0.12))
             return chosen_id, amt, 0, 0
         if chosen_action_name in ("FOLD", "CHECK", "CALL"):

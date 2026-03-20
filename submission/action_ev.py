@@ -246,6 +246,7 @@ def ev_action_decision(
     if can_fold:
         evs["FOLD"] = ev_fold
 
+    min_call_winrate = None
     if call_amount > 0 and street >= 2 and "CALL" in evs:
         pot_odds_pct = (100.0 * call_amount) / max(1.0, (pot + call_amount))
         bet_ratio = call_amount / max(1.0, pot)
@@ -286,6 +287,15 @@ def ev_action_decision(
     if can_check and "FOLD" in evs:
         evs.pop("FOLD")
 
+    strong_call_bias_guard = (
+        call_amount > 0
+        and street >= 2
+        and "CALL" in evs
+        and "FOLD" in evs
+        and ev_call >= max(1.0, 0.10 * pot)
+        and (min_call_winrate is None or winrate >= (min_call_winrate + 10.0))
+    )
+
     evs = _apply_action_biases(evs, action_biases)
 
     best, candidates = select_action_with_exploration(
@@ -294,6 +304,11 @@ def ev_action_decision(
         exploration=exploration,
         rng=rng,
     )
+
+    # Anti-predict biases are only meant to shape marginal turn/river calls.
+    # Do not let them turn a clearly profitable bluff-catcher into a fold.
+    if strong_call_bias_guard and best == "FOLD":
+        best = "CALL"
 
     if best == "FOLD" and can_call:
         noise_margin = 0.05 * pot
